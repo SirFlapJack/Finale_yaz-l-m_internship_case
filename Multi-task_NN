@@ -1,0 +1,158 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+file_path = "/content/data.xlsx"  # Upload your file to Colab and set the path
+data = pd.read_excel(file_path)
+
+numerical_columns = ['amount', 'company_code']
+categorical_columns = ['payment_type', 'currency_code', 'transaction_type']
+
+data[numerical_columns] = data[numerical_columns].fillna(0)
+data[categorical_columns] = data[categorical_columns].fillna('Unknown')
+
+ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+categorical_encoded = ohe.fit_transform(data[categorical_columns])
+scaler = StandardScaler()
+numerical_scaled = scaler.fit_transform(data[numerical_columns])
+
+X = np.concatenate([categorical_encoded, numerical_scaled], axis=1)
+
+target_cols = ['seller_number', 'customer_number', 'main_account']
+encoders = {col: LabelEncoder() for col in target_cols}
+for col in target_cols:
+    data[col] = encoders[col].fit_transform(data[col])
+
+y = data[target_cols].values
+
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.4, random_state=42, shuffle=True)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, shuffle=True)
+
+class CustomDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+def get_loader(X, y, batch_size, shuffle):
+    dataset = CustomDataset(X, y)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+batch_size = 32
+train_loader = get_loader(X_train, y_train, batch_size, shuffle=True)
+val_loader = get_loader(X_val, y_val, batch_size, shuffle=False)
+test_loader = get_loader(X_test, y_test, batch_size, shuffle=False)
+
+class MultiTaskNN(nn.Module):
+    def __init__(self, input_size, num_classes_per_task):
+        super(MultiTaskNN, self).__init__()
+        self.shared_fc1 = nn.Linear(input_size, 128)
+        self.shared_fc2 = nn.Linear(128, 64)
+        self.relu = nn.ReLU()
+
+        self.output_seller = nn.Linear(64, num_classes_per_task['seller_number'])
+        self.output_customer = nn.Linear(64, num_classes_per_task['customer_number'])
+        self.output_main_account = nn.Linear(64, num_classes_per_task['main_account'])
+
+    def forward(self, x):
+        x = self.relu(self.shared_fc1(x))
+        x = self.relu(self.shared_fc2(x))
+        return self.output_seller(x), self.output_customer(x), self.output_main_account(x)
+
+num_classes_per_task = {
+    'seller_number': len(np.unique(data['seller_number'])),
+    'customer_number': len(np.unique(data['customer_number'])),
+    'main_account': len(np.unique(data['main_account']))
+}
+
+model = MultiTaskNN(X_train.shape[1], num_classes_per_task)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+
+epochs = 50
+best_val_loss = float('inf')
+
+for epoch in range(epochs):
+    model.train()
+    total_loss, loss_seller, loss_customer, loss_main = 0, 0, 0, 0
+
+    for X_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        seller_out, customer_out, main_out = model(X_batch)
+        seller_loss = criterion(seller_out, y_batch[:, 0])
+        customer_loss = criterion(customer_out, y_batch[:, 1])
+        main_loss = criterion(main_out, y_batch[:, 2])
+        loss = seller_loss + customer_loss + main_loss
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        loss_seller += seller_loss.item()
+        loss_customer += customer_loss.item()
+        loss_main += main_loss.item()
+
+    scheduler.step()
+
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            seller_out, customer_out, main_out = model(X_batch)
+            val_loss += (
+                criterion(seller_out, y_batch[:, 0]) +
+                criterion(customer_out, y_batch[:, 1]) +
+                criterion(main_out, y_batch[:, 2])
+            ).item()
+
+    val_loss /= len(val_loader)
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), "best_model.pth")
+
+    print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss:.4f}, "
+          f"Seller Loss: {loss_seller:.4f}, Customer Loss: {loss_customer:.4f}, "
+          f"Main Loss: {loss_main:.4f}, Val Loss: {val_loss:.4f}")
+
+model.load_state_dict(torch.load("best_model.pth"))
+
+model.eval()
+all_seller_preds, all_customer_preds, all_main_preds = [], [], []
+all_seller_targets, all_customer_targets, all_main_targets = [], [], []
+
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        seller_out, customer_out, main_out = model(X_batch)
+        all_seller_preds.append(torch.argmax(seller_out, dim=1).cpu().numpy())
+        all_customer_preds.append(torch.argmax(customer_out, dim=1).cpu().numpy())
+        all_main_preds.append(torch.argmax(main_out, dim=1).cpu().numpy())
+        all_seller_targets.append(y_batch[:, 0].cpu().numpy())
+        all_customer_targets.append(y_batch[:, 1].cpu().numpy())
+        all_main_targets.append(y_batch[:, 2].cpu().numpy())
+
+all_seller_preds = np.concatenate(all_seller_preds)
+all_customer_preds = np.concatenate(all_customer_preds)
+all_main_preds = np.concatenate(all_main_preds)
+all_seller_targets = np.concatenate(all_seller_targets)
+all_customer_targets = np.concatenate(all_customer_targets)
+all_main_targets = np.concatenate(all_main_targets)
+
+seller_acc = accuracy_score(all_seller_targets, all_seller_preds)
+customer_acc = accuracy_score(all_customer_targets, all_customer_preds)
+main_acc = accuracy_score(all_main_targets, all_main_preds)
+
+print(f"Seller Accuracy: {seller_acc:.2%}")
+print(f"Customer Accuracy: {customer_acc:.2%}")
+print(f"Main Account Accuracy: {main_acc:.2%}")
