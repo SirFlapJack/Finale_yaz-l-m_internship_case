@@ -1,1 +1,0 @@
-# Finale_yaz-l-m_internship_case
